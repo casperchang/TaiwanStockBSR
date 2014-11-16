@@ -20,6 +20,14 @@ from pandas import Series, DataFrame
 # OTC : Over-the-Counter , 櫃檯中心 （上櫃）
 # BSR : Buy Sell Report , 分公司買賣進出表
 
+num_thread_tse = 5
+num_thread_otc = 5
+
+retryTSEList = []
+retryOTCList = []
+
+timesleep = [0.5, 1.0, 2.0, 3.0, 5.0] #five level delay for regression
+sleeplevel = 0
 
 class ThreadingDownloadBot(threading.Thread):
 	def __init__(self, pid, queue):
@@ -35,7 +43,7 @@ class ThreadingDownloadBot(threading.Thread):
 				print 'self.queue.Empty'
 			else:
 				if self.pid < 5: # fast otc thread
-					sleep(0.5)
+					sleep(timesleep[sleeplevel])
 				retry = 0
 				if ',' in Code:
 					retry = int(Code.split(',')[1])
@@ -46,10 +54,14 @@ class ThreadingDownloadBot(threading.Thread):
 					retry +=1
 					if retry >= 3:
 						print 'fail3, ' + Code #print u'%s 下載三次失敗'%(Code)
+						if self.pid < 5: # thread for OTC
+							retryOTCList.append(Code)
+						else:
+							retryTSEList.append(Code)
 					else:
 						retryCode = '%s,%d'%(Code,retry)
 						#print 'retry: ' + retryCode
-						sleep(1) #有錯誤停1秒, sleep before putting into queue
+						sleep(timesleep[1]) #有錯誤停1秒, sleep before putting into queue
 						self.queue.put(retryCode)
 			self.queue.task_done() #used by consumer thread, tells the queue that task is completed.
         
@@ -226,53 +238,66 @@ def getDateForOTC(CodeDict):
 				return date
 	return None
 
+#20141116 utility for recursive version
+def startDownloadData( _type, _list, _dateOTC=None): #_type: 0=OTC, 1=TSE
+	starttime = time()
+	q = Queue.Queue()
+	
+	if _type == 0: #OTC
+		for i in range(num_thread_otc):
+			t = DownloadOTCBot(i, q, _dateOTC)
+			t.setDaemon(True) #the thread t is terminated when the main thread ends.
+			t.start()
+	else: #TSE
+		for i in range(num_thread_tse):
+			t = DownloadTSEBot(i+num_thread_otc, q) #shifted thread id from otc group
+			t.setDaemon(True)
+			t.start()
+
+	for Code in _list[:]:
+		if Code[0].isdigit(): #some stock have character id at tail, like '2833A'
+			q.put(Code)
+	
+	q.join()
+	endtime = time()
+	if _type == 0: #OTC
+		print 'end of OTC, ' + 'time: ' + str(endtime - starttime)
+	else:
+		print 'end of TSE, ' + 'time: ' + str(endtime - starttime)
+		global retryTSEList
+		faillist = []
+		if len(retryTSEList) != 0:
+			faillist = retryTSEList
+			retryTSEList = []
+		print 'length of faillist %d' % len(faillist)
+		print 'length of retryTSEList %d' % len(retryTSEList)
+		return faillist
+
+
+
 if __name__ == '__main__':
 	if not os.path.exists('BSR'):
 		os.makedirs('BSR')
 
 	CodeDict = {}
+	faillist = []
 	CodeDict['TSE'] = getCodeListFromCSV('TSECode.csv')
 	CodeDict['OTC'] = getCodeListFromCSV('OTCCode.csv')
 	print 'TSE:%d, OTC:%d' % (len(CodeDict['TSE']), len(CodeDict['OTC']))
 
-	num_thread_otc = 5
-	num_thread_tse = 5
-
 	#preprocessing for otc
 	otcdate = getDateForOTC(CodeDict)
 
-	starttime = time()
-	OTCqueue = Queue.Queue()
-	for i in range(num_thread_otc):
-		t = DownloadOTCBot(i, OTCqueue, otcdate)
-		t.setDaemon(True) #the thread t is terminated when the main thread ends.
-		t.start()
+	''' 20141116 add recursive function for TSE with longer delay for the failed stocks '''
 
-	for Code in CodeDict['OTC'][:]:
-		if Code[0].isdigit(): #some stock have character id at tail, like '2833A'
-			OTCqueue.put(Code)
+	# download OTC
+	startDownloadData(0, CodeDict['OTC'], otcdate)
+	# download TSE
+	faillist = startDownloadData(1, CodeDict['TSE'])
 
-	OTCqueue.join()
-	endtime = time()
-	print 'end of otc, ' + 'time: ' + str(endtime - starttime)
-
-	starttime = time()
-	TSEqueue = Queue.Queue()
-	for i in range(num_thread_tse):
-		t = DownloadTSEBot(i+num_thread_otc, TSEqueue) #shifted thread id from otc group
-		t.setDaemon(True)
-		t.start()
-
-
-	for Code in CodeDict['TSE'][:]:
-		if Code[0].isdigit():
-			TSEqueue.put(Code)
-#	TSEqueue.put('1469')
-
-
-	TSEqueue.join() #Blocks until all items in the queue have been gotten and processed.
-	endtime = time()
-	print 'end of tse, ' + 'time: ' + str(endtime - starttime)
-
+	# re-download the TSE faillist with longer time delay
+	while( len(faillist) != 0 and sleeplevel < 5 ):
+		sleeplevel += 1
+		faillist = startDownloadData(1, faillist)
 
 
